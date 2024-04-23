@@ -27,3 +27,5 @@ The screen can be ordered here: https://www.buydisplay.com/spi-1280x400-7-84-inc
 choose 5V DC, 8080 interface on pin header, add the touch panel
 
 You can read more about the work in the library headers files.
+
+A hookup guide is provided to show a fully working demo using the Micro Mod ATP carrier board. <img width="612" alt="image" src="https://github.com/leutholl/TFT0784_mm/assets/5789698/fba82003-5c52-41c7-8c99-f73fc9fd8190">
