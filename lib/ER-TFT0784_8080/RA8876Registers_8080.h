@@ -1,17 +1,49 @@
 //**************************************************************//
 /*
-File Name : Ra8876_Lite.h                                   
-Author    : RAiO Application Team                             
-Edit Date : 12/29/2015
-Version   : v1.0
-*
-* Modified Version of: File Name : Ra8876_Lite.h                                   
- *			Author    : RAiO Application Team                             
+ * RA8876Registers_8080.h
+ *
+ * AUTHOR: Lukas Leuthold
+ * DATE: FEB 2024
+ * VERSION: 1.0
+ *
+ * Library for the RA8876 using Teensy MicroMod and FlexIO2 in
+ * MultiBeat and DMA mode. LVGL can compute the next buffer while
+ * DMA is shifting the current buffer to the display. This plus the
+ * four SHIFTERS of FlexIO2 allows for a very fast refresh rate.
+ *
+ * The library is minimized to work with lvgl. Primitive drawing
+ * and text, cursor, pip etc... was removed. Instead of 8000 lines
+ * it is now 2000 lines long. Using lvgl, you wouldn't need the text
+ * features and other things anyway and instead work with buffers.
+ *
+ * lvgl knows which area of the screen is dirty and will send the buffer to
+ * update the screen just for that area. Using BTE&ROP feature of the RA8876
+ * we can then place a picture of the buffer at the right location so that we
+ * can only update the dirty part of the screen which lvgl will tell us.
+ * This greatly reduces the overhead to otherwise full send a full screen
+ * refresh.
+ *
+ * How fast is it you ask? Well on this 1280x400 screen it can do up to 40 fps
+ * when doing large area updates. When doing small area updates it can do up to
+ * 60 fps. In comparison the RA8876 with SPI and DMA can only do around 4 fps
+ * for larger areas. This is around 10 times faster. Larger UI components like
+ * the roller control which uses animation are finally buttery smooth.
+ *
+ * Should you need additional functionality, please take it from the original library
+ *
+ * ORIGINAL:
+ *
+ * Ra8876LiteTeensy.cpp
+ * Modified Version of: File Name : RA8876_8080.cpp
+ *			Author    : RAiO Application Team
  *			Edit Date : 09/13/2017
- * 	  	     : For Teensy 3.x and T4
- *                   : By Warren Watson
- *                   : 06/07/2018 - 11/31/2019
- *                   : Copyright (c) 2017-2019 Warren Watson.
+ *			Version   : v2.0  1.modify bte_DestinationMemoryStartAddr bug
+ *                 			  2.modify ra8876SdramInitial Auto_Refresh
+ *                 			  3.modify ra8876PllInitial
+ * 	  	      : For Teensy 3.x and T4
+ *                    : By Warren Watson
+ *                    : 06/07/2018 - 11/31/2019
+ *                    : Copyright (c) 2017-2019 Warren Watson.
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -44,14 +76,6 @@ typedef uint8_t		ru8;
 typedef uint16_t	ru16;
 typedef uint32_t	ru32;
 
-#define RA8876_SPI_CMDWRITE    0x00
-#define RA8876_SPI_DATAWRITE   0x80
-#define RA8876_SPI_DATAREAD    0xc0
-#define RA8876_SPI_STATUSREAD  0x40
-#define RA8876_SPI_CMDWRITE16    (ru16)0x0000
-#define RA8876_SPI_DATAWRITE16   (ru16)0x8000
-#define RA8876_SPI_DATAREAD16    (ru16)0xc000
-#define RA8876_SPI_STATUSREAD16  (ru16)0x4000
 
 /*==== [SW_(1)]  PLL  =====*/
 //Crystal resonator for RA8876, suggested 10MHz
@@ -78,7 +102,11 @@ typedef uint32_t	ru32;
 //#define MT48LC4M16A
 //#define K4S641632N
 //#define K4S281632K
-#define INTERNAL_LT7683
+#define INTERNAL_LT7683 //LL
+
+//Physical size of screen - these numbers won't change even if rotation is applied or status bar occupies some screen area
+#define SCREEN_WIDTH 400
+#define SCREEN_HEIGHT 1280
 
 /*TFT timing configure => CUSTOMIZE TO YOUR PANEL */
 #define TFT_MODE   0  //0:SYNC_mode(SYNC+DE mode), 1: DE mode  //if sync only mode do not connect DE signal or XDE_INV = 1
@@ -86,24 +114,16 @@ typedef uint32_t	ru32;
 #define XVSYNC_INV  1 // 0:no inversion, 1:inversion 
 #define XDE_INV     0 // 0:no inversion, 1:inversion 
 #define XPCLK_INV  1  // 0:no inversion, 1:inversion 
-#define HPW       70   //
+#define HPW       24 //70   //
 #define HND       160
-#define HDW       400  // LL customize
+#define HDW       SCREEN_WIDTH
 #define HST       160
-#define VPW       10
-#define VND       23
-#define VDH       1280   // LL customize
+#define VPW       2 //10
+#define VND       10 //23
+#define VDH       SCREEN_HEIGHT
 #define VST       12
 
 #define RA8877_LVDS_FORMAT  0    // 0:Format1(VESA format), 1:Format2 =(JEIDA format) 
-
-//Physical size of screen - these numbers won't change even if rotation is applied or status bar occupies some screen area
-#define SCREEN_WIDTH HDW
-#define SCREEN_HEIGHT VDH
-
-//pixels to reserve for status line (if any status line functions get used)
-#define STATUS_LINE_HEIGHT 24
-
 
 /*Page(image buffer) configure*/
 /*The maximum number of pages is based on SDRAM capacity and color depth and width and height of one page*/
@@ -111,28 +131,9 @@ typedef uint32_t	ru32;
 /*The SDRAM is divided into several image buffers and the maximum number of image buffers is limited by the 
 memory size. For example : page_size = 1024*600*2byte(16bpp) = 1228800byte, maximum number = 16/1.2288 */
 /*vertical multi page application*/
-#define PAGE1_START_ADDR  0
-#define PAGE2_START_ADDR  HDW*VDH*2   // 1228800 bytes
-#define PAGE3_START_ADDR  HDW*VDH*2*2 // 2457600 
-#define PAGE4_START_ADDR  HDW*VDH*2*3
-#define PAGE5_START_ADDR  HDW*VDH*2*4
-#define PAGE6_START_ADDR  HDW*VDH*2*5
-#define PAGE7_START_ADDR  HDW*VDH*2*6
-#define PAGE8_START_ADDR  HDW*VDH*2*7
-#define PAGE9_START_ADDR  HDW*VDH*2*8
-#define PAGE10_START_ADDR  HDW*VDH*2*9
 
-#define PATTERN1_RAM_START_ADDR HDW*VDH*2*10
-#define PATTERN2_RAM_START_ADDR (HDW*VDH*2*10)+(16*16*2)
-#define PATTERN3_RAM_START_ADDR (HDW*VDH*2*10)+(16*16*2)+(16*16*2)
 
-/*DMA picture data start address*/
-#define WP1_ADDR  0
-#define WP2_ADDR  HDW*VDH*2
-#define WP3_ADDR  HDW*VDH*2*2
-#define WP4_ADDR  HDW*VDH*2*3
-#define WP5_ADDR  HDW*VDH*2*4
-#define WP6_ADDR  HDW*VDH*2*5
+#define PAGE_TO_ADDR(page)  ((page-1)*HDW*VDH*2)
 
 #define COLOR65K_BLACK         0x0000
 #define COLOR65K_WHITE         0xffff
@@ -187,26 +188,6 @@ memory size. For example : page_size = 1024*600*2byte(16bpp) = 1228800byte, maxi
 #define COLOR65K_GRAYSCALE28   2113*28
 #define COLOR65K_GRAYSCALE29   2113*29
 #define COLOR65K_GRAYSCALE30   2113*30
-
-#define STRING_LINE1  0
-#define STRING_LINE2  32
-#define STRING_LINE3  32*2
-#define STRING_LINE4  32*3
-#define STRING_LINE5  32*4
-#define STRING_LINE6  32*5
-#define STRING_LINE7  32*6
-#define STRING_LINE8  32*7
-#define STRING_LINE9  32*8
-#define STRING_LINE10  32*9
-#define STRING_LINE11  32*10
-#define STRING_LINE12  32*11
-#define STRING_LINE13  32*12
-#define STRING_LINE14  32*13
-#define STRING_LINE15  32*14
-#define STRING_LINE16  32*15
-#define STRING_LINE17  32*16
-#define STRING_LINE18  32*17
-#define STRING_LINE19  32*18
 
 /*RA8876,8877 register & bit*/
 #define RA8876_SRR  0x00
@@ -846,178 +827,6 @@ memory size. For example : page_size = 1024*600*2byte(16bpp) = 1228800byte, maxi
 #define	cClrb5		0xdf
 #define	cClrb6		0xbf
 #define	cClrb7		0x7f
-
-// Lets see about supporting Adafruit fonts as well?
-#ifndef _GFXFONT_H_
-#define _GFXFONT_H_
-/// Font data stored PER GLYPH
-typedef struct {
-	uint16_t bitmapOffset;     ///< Pointer into GFXfont->bitmap
-	uint8_t  width;            ///< Bitmap dimensions in pixels
-    uint8_t  height;           ///< Bitmap dimensions in pixels
-	uint8_t  xAdvance;         ///< Distance to advance cursor (x axis)
-	int8_t   xOffset;          ///< X dist from cursor pos to UL corner
-    int8_t   yOffset;          ///< Y dist from cursor pos to UL corner
-} GFXglyph;
-
-/// Data stored for FONT AS A WHOLE
-typedef struct { 
-	uint8_t  *bitmap;      ///< Glyph bitmaps, concatenated
-	GFXglyph *glyph;       ///< Glyph array
-	uint8_t   first;       ///< ASCII extents (first char)
-    uint8_t   last;        ///< ASCII extents (last char)
-	uint8_t   yAdvance;    ///< Newline distance (y axis)
-} GFXfont;
-
-#endif // _GFXFONT_H_ 
-
-// Define USE_FF_FONTLOAD to 1 if using FatFS to load user defined fonts
-// from a disk drive. Needs FatFS, SDFat or SD. fontLoad() is currently
-// setup to use FatFS.
-// Else, set to 0
-#define USE_FF_FONTLOAD 0
-
-/* Screen Page Addresses */
-#define SCREEN_1  0
-#define SCREEN_2  1024*600*2
-#define SCREEN_3  1024*600*2*2
-#define SCREEN_4  1024*600*2*3
-#define SCREEN_5  1024*600*2*4
-#define SCREEN_6  1024*600*2*5
-#define SCREEN_7  1024*600*2*6
-#define SCREEN_8  1024*600*2*7
-#define SCREEN_9  1024*600*2*8
-//#define SCREEN_10  1024*600*2*9 // Used for CGRAM at this time
-
-typedef struct boxSaveGet boxSaveGet_t;
-
-/* Struct used for BTE block xfers */
-struct boxSaveGet {
-	uint8_t id;
-	uint8_t id_next;
-	uint16_t x0;
-	uint16_t y0;
-	uint16_t x1;
-	uint16_t y1;
-	uint32_t vpage;
-};
-
-
-/* Struct for saving and retrieving screen page parameters */
-struct tftSave {
-	int16_t	 width;
-	int16_t  height;
-	int16_t	 cursorX;
-	int16_t  cursorY;
-	uint8_t  scaleX;
-	uint16_t scaleY;
-	uint8_t	 FNTwidth;
-	uint8_t  FNTheight;
-	uint8_t  fontheight;
-	uint8_t  fontSource;
-	uint8_t  TXTparameters;
-	uint8_t  cursorXsize;
-	uint8_t  cursorYsize;
-	uint32_t currentPage;
-	uint32_t pageOffset;
-// Text Sreen Vars
-	uint16_t  prompt_size; // prompt ">"
-	uint16_t prompt_line; // current text prompt row
-	uint8_t	 vdata;
-	uint8_t  leftmarg;
-	uint8_t  topmarg;
-	uint8_t  rightmarg;
-	uint8_t  bottommarg;
-	uint8_t  tab_size;
-	uint16_t CharPosX;
-	uint16_t CharPosY;
-	boolean	 UDFont;
-//scroll vars ----------------------------
-	uint16_t  scrollXL;
-	uint16_t  scrollXR;
-	uint16_t  scrollYT;
-	uint16_t  scrollYB;
-// Color vars ----------------------------
-	uint16_t TXTForeColor;
-    uint16_t TXTBackColor;
-};
-
-typedef struct tftSave tftSave_t;
-
-
-typedef struct Gbuttons gbuttons_t;
-/* Struct for graphic buttons */
-/* Based on Adafruit graphic buttons */
-/* Not completly implemented at this time */
-struct Gbuttons {
-  boolean initialzed;
-  uint16_t x;
-  uint16_t y;
-  uint16_t w;
-  uint16_t h;
-  uint16_t outlinecolor;
-  uint16_t fillcolor;
-  uint16_t textcolor;
-  uint16_t textsize;
-  boolean currstate;
-  boolean laststate;
-  char     label[10];
-};
-
-//https://i.pinimg.com/736x/4b/50/12/4b5012fc9d868d0394da7fa8217d7f92.jpg
-#define BLACK		0x0000
-#define WHITE		0xffff
-#define RED			0xf800
-#define LIGHTRED	0xfc10
-#define CRIMSON		0x8000
-#define GREEN		0x07e0
-#define PALEGREEN	0x87f0
-#define DARKGREEN	0x0400
-#define BLUE		0x001f
-#define LIGHTBLUE	0x051f
-#define SKYBLUE		0x841f
-#define DARKBLUE	0x0010
-#define YELLOW		0xffe0
-#define LIGHTYELLOW	0xfff0
-#define DARKYELLOW	0x8400 // mustard
-#define CYAN		0x07ff
-#define LIGHTCYAN	0x87ff
-#define DARKCYAN	0x0410
-#define MAGENTA		0xf81f
-#define VIOLET		0xfc1f
-#define BLUEVIOLET	0x8010
-#define ORCHID		0xA145 
-
-/*--------------------------------------*/
-/* [RENDER TEXT OPTIMIZATIONS] +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ 
-From 0.70b11 the Font Rendering Engine has some optimizations for render font faster but this require much more code.
-Not all users need this so you can select if include Render Text Optimizations or not by comment the following line. */
-#define _RA8875_TXTRNDOPTIMIZER								// [default uncommented]
-//#define RA8875_VISPIXDEBUG 								// [default commented]
-#define FORCE_RA8875_TXTREND_FOLLOW_CURS 					// [default uncommented]
-
-	#define CENTER 				9998
-	#define ARC_ANGLE_MAX 		360		
-	#define ARC_ANGLE_OFFSET 	-90	
-	#define ANGLE_OFFSET		-90
-
-
-#ifndef bitRead
-	#define bitRead(a,b) ((a) & (1<<(b)))
-#endif
-#ifndef bitWrite
-	#define __bitSet(value, bit) ((value) |= (1UL << (bit)))
-	#define __bitClear(value, bit) ((value) &= ~(1UL << (bit)))
-	#define bitWrite(value, bit, bitvalue) (bitvalue ? __bitSet(value, bit) : __bitClear(value, bit))
-#endif
-
-/*   Font Sizes   */
-const static uint8_t fontDimPar[4][5] = {
-	{8,16,2,4,0},// INT font
-	{8,16,3,0,0},// ROM X16
-	{12,24,2,2,0},//ROM X24
-	{16,32,2,2,0},//ROM X32
-};
 
 #endif
 

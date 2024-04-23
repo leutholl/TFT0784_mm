@@ -1,427 +1,274 @@
+//**************************************************************//
+/*
+ * main.cpp
+ *
+ * AUTHOR: Lukas Leuthold
+ * DATE: FEB 2024
+ * VERSION: 1.0
+ *
+ * This is a demo to drive the ER-TFT0784 7.84" 1280x400 display with the RA8876 and SSD2828 bridge using
+ * - lvgl
+ * - own-implemented software rotation to put the screen in landscape mode. No rotation on lvgl needed so Squareline projects in landscape are working.
+ * - 8080 parallel 8-bit mode read and write.
+ * - 16 bit color mode.
+ * - using DMA. Lvgl can compute the next buffer while the current buffer is being shifted out. Nice!
+ * - using MultiBeat on FlexIO2 which is only available on Teensy MicroMod or your custom board.
+ * - with capacitive touch input from GT911 on I2C - rotated coordinates to map back to lvgl positions. It currently only logs touches but is prepared for lvgl UIs.
+ *     -- The GT911 is typically already flashed out of factory with the correct resolution and config. You can reflash it with the GT911 library but first patch the Wire library for super large I2C buffers.
+ * - with a little animation to show how to use lvgl buffes with the RA8876 BTE&ROP feature.
+ * - uses RA8876 internal PWM for backlight control. Solder the jumpers on the ER-TFT0784 to enable internal PWM backlight control.
+ * 
+ * - This works on a MicroMod Teensy with the ATP board. The ER-TFT0784 is connected to the ATP board with Dupont cables. Using 20 MHz is working well.
+ * 
+ * with all the optimizations, the display is very responsive and fast. The lvgl animations are smooth and the touch input is very responsive.
+ * The demo (a red ball sliding back and forth, which changes in size) and setting 40 FPS in lv_conf.h is running at 40 FPS with about 5 % CPU load.
+ * Because the ball is changing size, lvgl buffer needs to sent in multiple junks when the ball is in the middle of the screen. Areas where the ball left must be updated as well.
+ * The ball grows up to 200 pixels which is half of the screen height. This is a lot of pixels and a lot of things must be done right for a clean drawing.
+ * Compared to SPI with DMA the same demo will run at around only 4 fps. Some lvgl ui components use animation and this is where this project shines.
+ * 
+ * The whole thread of ups and downs is here: https://github.com/wwatson4506/Ra8876LiteTeensy/issues/16
+ * 
+ * You can read more about the work in the library headers files.
+ * 
+ */
+//**************************************************************//
+
+
 #include <Arduino.h>
 #include <Metro.h>
-#include "ER-TFT0784_8080.h" //TFT Driver
-#include <lvgl.h>       //UI Library
+#include <lvgl.h>
 
-//Metro blinkTimer(500);
-#define SCREENWIDTH 400
-#define SCREENHEIGHT 1280
-#define BUFFER_SIZE (SCREENWIDTH * 128)  //recommended is *10 but this sketch has nothing else useful to do with the memory available on Teensy 4, so go large!
+#include "ER-TFT0784_8080.hpp"
+#include "Wire.h"
+#include "GT911.h"
 
-        static lv_disp_draw_buf_t disp_buf;
-        static DMAMEM lv_color_t buf_1[BUFFER_SIZE] __aligned(32);
-        static DMAMEM lv_color_t buf_2[BUFFER_SIZE] __aligned(32);
-        static lv_disp_drv_t  disp_drv;
-        static lv_disp_t*     disp;
+// Touch
+#define GT911_INT_PIN 29
+#define GT911_RST_PIN 0
+GT911 touch = GT911();
+
+// Additional Display Pins for ER-TFT0784. The Databus is connected to the Teensy MicroMod FlexIO2 like this
+/*
+    Pin 10 => FlexIO2:0 WR
+    Pin 12 => FlexIO2:1 RD
+    Pin 40 => FlexIO2:4 D0
+    Pin 41 => FlexIO2:5 |
+    Pin 42 => FlexIO2:6 |
+    Pin 43 => FlexIO2:7 |
+    Pin 44 => FlexIO2:8 |
+    Pin 45 => FlexIO2:9 |
+    Pin 6 => FlexIO2:10 |
+    Pin 9 => FlexIO2:11 D7
+
+    You must not change these pins as they are hardcoded in the library and FlexIO2 needs it that way.
+    
+    You can change the other additional pins as you like here:
+*/
+
+#define _2828_CS_PIN   2
+#define _2828_RST_PIN  3
+#define _2828_SDI_PIN  4
+#define _2828_SCK_PIN  5
+#define _8876_CS_PIN   16
+#define _8876_DC_PIN   11
+#define _8876_RST_PIN  17
+#define _8876_WAIT_PIN 26  // The library uses this pin to wait for the RA8876 to be ready instead of polling the Status Register. Connect to WINT pin.
+
+#define SCREENWIDTH 1280
+#define SCREENHEIGHT 400
+
+ER_TFT0784_8080 TFT = ER_TFT0784_8080(_2828_CS_PIN, _2828_RST_PIN, _2828_SDI_PIN, _2828_SCK_PIN, _8876_CS_PIN, _8876_DC_PIN, _8876_RST_PIN, _8876_WAIT_PIN);
+
+#define BUFFER_SIZE (SCREENWIDTH * SCREENHEIGHT / 10)  // About 10th of the screen is large enough. If very small, the BTE&ROP overhead is too large.
+
+#define LVGL_DRAW_8876_CANVAS 1 // Which RA8876 page or canvas lvgl shall draw to. Some projects use multiple canvases and combine them later.
+#define VISIBLE_8876_CANVAS 1   // Which RA8876 page or canvas is visible. This is the canvas that is shown on the screen. It can be different from the drawing canvas.
+#define NON_LVGL_DRAW_8876_CANVAS 2 // If you have multiple canvases, you can draw to one and then combine them to the visible canvas.
+
+// lvgl stuff
+static lv_disp_draw_buf_t disp_buf;
+static DMAMEM lv_color_t buf_1[BUFFER_SIZE] __aligned(32);
+static DMAMEM lv_color_t buf_2[BUFFER_SIZE] __aligned(32);
+static lv_disp_drv_t disp_drv;
+static lv_disp_t* disp;
+static lv_indev_drv_t indev_drv;
 
 
-ER_TFT0784_8080 TFT = ER_TFT0784_8080(2,3,4,5); //SSD pins
-                  
-              
-//volatile uint32_t DMAMEM *rotated_image __attribute__((aligned(32))) = nullptr;
+DMAMEM uint16_t rotated_image[BUFFER_SIZE] __aligned(32);
 
-unsigned long start;
-unsigned long end;
+volatile bool isLastBuffer = false;
 
-#define myTRIG 36
+Metro lvglTaskTimer = Metro(5);  // 5ms as recommended by lvgl library
 
-Metro     lvglTaskTimer       = Metro(5);        //5ms as recommended by lvgl library
-
-static void anim_x_cb(void * var, int32_t v)
-{
-   lv_obj_set_y(var, v);
+static void anim_x_cb(lv_obj_t* var, int32_t v) {
+    lv_obj_set_x(var, v);
 }
 
-static void anim_size_cb(void * var, int32_t v)
-{
-   lv_obj_set_size(var, v, v);
+static void anim_size_cb(lv_obj_t* var, int32_t v) {
+    lv_obj_set_size(var, v, v);
 }
 
+FASTRUN void my_disp_flush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
+    uint16_t width = (area->x2 - area->x1 + 1);
+    uint16_t height = (area->y2 - area->y1 + 1);
 
-void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+    // rotate the buffer image
+    for (uint16_t y = 1; y <= height; y++) {
+        for (uint16_t x = 0; x < width; x++) {
+            rotated_image[x * height + (height - y)] = color_p++->full;
+        }
+    }
 
-  
-  
-  uint16_t width = (area->x2 - area->x1 + 1);
-  uint16_t height = (area->y2 - area->y1 + 1);
-  
-  /*
-  TFT.bteMpuWriteWithROPData16(TFT.pageStartAddress(0), TFT.width(), area->x1, area->y1,  //Source 1 is ignored for ROP12
-                         TFT.pageStartAddress(0), TFT.width(), area->x1, area->y1, width, height,     //destination address, pagewidth, x/y, width/height
-                         RA8876_BTE_ROP_CODE_12, (const unsigned short)color_p);  //code 12 means overwrite
-  */
+    // note that XY are swapped for the RA8876 and width and height are swapped in the arguments
+    uint16_t newY = area->x1;                            // swap x to y
+    uint16_t newX = SCREEN_WIDTH - area->y1 - height;  // swap y to x and reposition
 
-  //uint16_t rotated_image[width*height];
+    TFT.bteMpuWriteWithROPData16_MultiBeat_DMA(LVGL_DRAW_8876_CANVAS, SCREEN_WIDTH, newX, newY,                 // Source 1 is ignored for ROP 12
+                                               LVGL_DRAW_8876_CANVAS, SCREEN_WIDTH, newX, newY, height, width,  // destination address, pagewidth, x/y, width/height
+                                               RA8876_BTE_ROP_CODE_12,
+                                               rotated_image);
 
-  //rotated_image = TFT.rotateImageRect(width, height, (uint16_t*)color_p, 3);
-  //TFT.writeRotatedRect(area->x1, 400-area->y1, width, height, rotated_image);
-  
-  
-  ////// TFT.lvglRotateAndROP(area->x1, 400-area->y1-(height), width, height, (uint16_t*)color_p);
-  
+    //while (TFT.WR_DMATransferDone == false) {} //Wait for any DMA transfers to complete. This makes everything synchronous and slow. It nullifies the advantage of DMA. CPU load is 5 times higher.
 
-
-
-  
-  uint16_t rotated_image[width*height];
-  //uint32_t *rotated_colors_aligned = (uint32_t *)(((uintptr_t)rotated_image + 31) & ~((uintptr_t)(31)));
-  for (uint32_t i = 0; i < width*height; i++) {
-      rotated_image[i] = color_p->full; //color_p->full;
-      color_p++;
-  }
-
-  
-  
-
-  digitalWriteFast(myTRIG, LOW);
-
-  for (int i = 0; i < 6; i++) {
-    delayMicroseconds(1);
-    digitalToggleFast(myTRIG);
-  }
-
-  Serial.printf(" ==> Flush: %d,%d to %d,%d width=%d, height=%d pixels=%d at %d\n", area->x1, area->y1, area->x2, area->y2, width, height, width*height, millis());
-  TFT.writeRotatedRect(area->x1, area->y1, width, height, rotated_image);
-
-
-  //digitalWriteFast(myTRIG, HIGH);
-  while(TFT.WR_DMATransferDone == false) {} //Wait for any DMA transfers to complete
-  //digitalWriteFast(myTRIG, LOW);
-  
-  
-  //arm_dcache_flush_delete(rotated_colors_aligned, width*height*sizeof(uint32_t));
-
-  /*
-	for(int i = 0; i < height*width; i++) {
-    //uint16_t pixel1 = *((uint16_t*)color_p);             // First 16-bit pixel
-    //uint16_t pixel2 = *((uint16_t*)color_p++);       // Second 16-bit pixel
-    rotated_image[i] = color_p->full;
-    color_p++;
-    //color_p[i] = (lv_color_to)COLOR65K_GREEN;
-      //color_p++;
-	}
-  */
-
-  //uint32_t *rotated_colors_aligned = (uint32_t *)(((uintptr_t)rotated_image + 32) & ~((uintptr_t)(31)));
-	
-  //TFT.writeRotatedRect(area->x1, area->y1, width, height, rotated_colors_aligned);
-  //while(TFT.WR_DMATransferDone == false) {} //Wait for any DMA transfers to complete
-  //free(buffer);
-  
-  
-  //Serial.printf("Flush: %d,%d to %d,%d width=%d, height=%d at %d\n", area->x1, area->y1, area->x2, area->y2, width, height, millis());
-
-  //TFT.writeRect2(area->x1, area->y1, width, height, (uint16_t*)color_p);
-  //Serial.printf("Flush: %d,%d to %d,%d at %d\n", area->x1, area->y1, area->x2, area->y2, millis());
-
-  /*
-  TFT.bteMpuWriteWithROP(TFT.pageStartAddress(9), TFT.width(), area->x1, area->y1,  //Source 1 is ignored for ROP12
-                         TFT.pageStartAddress(9), TFT.width(), area->x1, area->y1, width, height,     //destination address, pagewidth, x/y, width/height
-                         RA8876_BTE_ROP_CODE_12);  //code 12 means overwrite
-  
-  TFT.pushPixels16bitAsync(0xAA, area->x1, area->y1, area->x2, area->y2); // 16 bit color
-  */
-  /*
-  TFT.startSend();
-  SPI1.transfer(RA8876_SPI_DATAWRITE);
-  TFT.activeDMA = true;
-  spiDMAEvent.setContext(disp);  // Set the contxt to us
-  //bool x  = SPI1.transfer(color_p, NULL, width * height, spiDMAEvent);  // 8bit color
-  bool x  = SPI1.transfer(color_p, NULL, width * height * 2, spiDMAEvent);  // * 2 for 16 bit. also uncomment line in bteMpuWriteWithROP in cpp file
-  if (!x) Serial.println("SPI busy");
-  //check return value of transfer
-  */
- 
- lv_disp_flush_ready(&disp_drv);
-  
-
+    isLastBuffer = lv_disp_flush_is_last(&disp_drv);
 }
 
-void drawTest() {
-  //TFT.Color_Bar_ON();
-  //TFT.drawLine(0, 0, 2, 3, COLOR65K_RED);
-
-  //TFT.setRotation(3); //x and y will swap as well
-
-  //TFT.Color_Bar_ON();
-  //uint16_t w = 240; //240
-  //uint16_t h = 320;  //320
- 
-  //rotated_image = TFT.rotateImageRect(240, 320, (uint16_t*)teensy40_pinout2, 0);
-  
-  
-  uint16_t w = 190;
-  uint16_t h = 600;
-  //uint16_t *rotated_image = (uint16_t *)malloc(w*h*sizeof(uint16_t));
-  uint16_t rotated_image[w*h];
-
-  for (uint32_t i = 0; i < w*h; i+=4) {
-      //rotated_image[j] = (teensy40_pinout2[i] << 16) | teensy40_pinout2[i+1];
-      //rotated_image[i] = teensy40_pinout2[i];
-      rotated_image[i] = COLOR65K_BLACK;
-      rotated_image[i+1] = COLOR65K_RED;
-      rotated_image[i+2] = COLOR65K_GREEN;
-      rotated_image[i+3] = COLOR65K_BLUE;
-      //rotated_image[i+1] = teensy40_pinout2[i+1];
-      //j = i%2 == 0 ? j+1 : j;
-  }
-
-
-  uint32_t *rotated_colors_aligned = (uint32_t *)(((uintptr_t)rotated_image + 32) & ~((uintptr_t)(31)));
-  start = micros();
-  // copy teensy40_pinout2 to rotated_image by memcopy so that the address is aligned to 32 bytes and is DMA
-  //memcpy((volatile uint32_t*)rotated_image, (uint16_t*)teensy40_pinout2, w*h*sizeof(uint16_t));
-  
-  /*
-  for (uint32_t i = 0; i < w*h; i++) {
-      //rotated_image[j] = (teensy40_pinout2[i] << 16) | teensy40_pinout2[i+1];
-      rotated_colors_aligned[i] = (COLOR65K_GREEN << 16) | COLOR65K_GREEN;
-      //j = i%2 == 0 ? j+1 : j;
-  }
-  */
-  
-
-  /*
-  rotated_image[w*h-1] = 0x07E0; //mark ending
-  rotated_image[w*h-2] = 0x07E0; //mark ending
-  rotated_image[w*h-3] = 0x07E0; //mark ending
-  rotated_image[w*h-4] = 0x07E0; //mark ending
-
-  rotated_image[0] = 0x07E0; //mark beginning
-  rotated_image[1] = 0x07E0; //mark beginning
-  rotated_image[2] = 0x07E0; //mark beginning
-  rotated_image[3] = 0x07E0; //mark beginning
-  */
-  
-
-  TFT.writeRotatedRect(10, 10, w, h, rotated_colors_aligned);
-  while(TFT.WR_DMATransferDone == false) {} //Wait for any DMA transfers to complete
-  end = micros();
-  Serial.printf("\n\nDMA transfer time: %lu us\n", end-start);
-
-  
-
-  for (uint32_t i = 0; i < w*h; i+=4) {
-      //rotated_image[j] = (teensy40_pinout2[i] << 16) | teensy40_pinout2[i+1];
-      //rotated_image[i] = teensy40_pinout2[i];
-      rotated_image[i] = COLOR65K_BLACK;
-      rotated_image[i+1] = COLOR65K_BLACK;
-      rotated_image[i+2] = COLOR65K_BLACK;
-      rotated_image[i+3] = COLOR65K_BLACK;
-      //rotated_image[i+1] = teensy40_pinout2[i+1];
-      //j = i%2 == 0 ? j+1 : j;
-  }
-  rotated_colors_aligned = (uint32_t *)(((uintptr_t)rotated_image + 32) & ~((uintptr_t)(31)));
-  start = micros();
-  TFT.writeRotatedRect(10+w, 10, w, h, rotated_colors_aligned);
-  while(TFT.WR_DMATransferDone == false) {} //Wait for any DMA transfers to complete
-  end = micros();
-  Serial.printf("\n\nDMA transfer time: %lu us\n", end-start);
-
-  start = micros();
-  for (uint32_t i = 0; i < w*h; i++) {
-      //rotated_image[j] = (teensy40_pinout2[i] << 16) | teensy40_pinout2[i+1];
-      //rotated_image[i] = teensy40_pinout2[i];
-      rotated_image[i] = COLOR65K_BLUE;
-      //rotated_image[i+1] = teensy40_pinout2[i+1];
-      //j = i%2 == 0 ? j+1 : j;
-  }
-  
-  rotated_colors_aligned = (uint32_t *)(((uintptr_t)rotated_image + 32) & ~((uintptr_t)(31)));
-  TFT.writeRotatedRect(10, h+10, w, h, rotated_colors_aligned);
-  while(TFT.WR_DMATransferDone == false) {} //Wait for any DMA transfers to complete
-  end = micros();
-  Serial.printf("\n\nDMA transfer time: %lu us\n", end-start);
-
-  start = micros();
-  for (uint32_t i = 0; i < w*h; i++) {
-      //rotated_image[j] = (teensy40_pinout2[i] << 16) | teensy40_pinout2[i+1];
-      //rotated_image[i] = teensy40_pinout2[i];
-      rotated_image[i] = COLOR65K_YELLOW;
-      //rotated_image[i+1] = teensy40_pinout2[i+1];
-      //j = i%2 == 0 ? j+1 : j;
-  }
-  
-  rotated_colors_aligned = (uint32_t *)(((uintptr_t)rotated_image + 32) & ~((uintptr_t)(31)));
-  TFT.writeRotatedRect(w+10, h+10, w, h, rotated_colors_aligned);
-  while(TFT.WR_DMATransferDone == false) {} //Wait for any DMA transfers to complete
-  end = micros();
-  Serial.printf("\n\nDMA transfer time: %lu us\n", end-start);
-
-
-
-
-  //for (uint32_t i = 0; i < w*h; i++) Serial.printf("img[%u] = 0x%x\n", i, rotated_image[i]);
-	//TFT.lvglRotateAndROP(100,100,w,h,rotated_image);
-  //TFT.pushPixels16bit(rotated_image, 100, 100, 100+w, 100+h);
-  //delay(5000);
-  
-  //TFT.writeRotatedRect(10, 10, w, h, (volatile uint16_t*)teensy40_pinout2);
-  
-  //Serial.println("Image written");
-
-  //TFT.Color_Bar_ON();
-  while (true) {};
-
+FASTRUN void DMAfinished() { // this is a callback of the LCD driver when DMA is finished. It is called from the ISR. LVGL needs to know when the DMA is done.
+    lv_disp_flush_ready(&disp_drv);
+    //if (isLastBuffer) TFT.updateScreenWithROP(LVGL_DRAW_8876_CANVAS, NON_LVGL_DRAW_8876_CANVAS, VISIBLE_8876_CANVAS, RA8876_BTE_ROP_CODE_14); // if application uses multiple canvases (e.g. non LVGL Drawings), we combine them here after lvgl is done.
 }
 
-void DMAfinished() {
-  //lv_disp_flush_ready(&disp_drv);
+void setupTouch() {
+    Wire.setClock(400000);
+    Wire.begin();
+    if (touch.begin(GT911_INT_PIN, GT911_RST_PIN) != true) {
+        Serial.println("Touch Module reset failed");
+    } else {
+        Serial.println("Touch Module reset OK");
+    }
+    Serial.print("Check Touch ACK on addr request on 0x");
+    Serial.print(touch.i2cAddr, HEX);
+    Wire.beginTransmission(touch.i2cAddr);
+    int error = Wire.endTransmission();
+    if (error != 0) {
+        Serial.print(": ERROR #"); Serial.println(error);
+    } else {
+        Serial.println(": SUCCESS");
+        // do config
+        /*
+         * GT911 is already flashed once - do not flash again every time
+        Serial.print("Setting resolution of TP");
+        uint8_t err = touch.fwResolution(1280, 400); //1280 x 400
+        if (err) {
+          Serial.print(", error: "); Serial.println(err, HEX);
+        } else Serial.println();
+
+
+        GTConfig* cfg = touch.readConfig();
+        Serial.print("config Ver: 0x");    Serial.println(cfg->configVersion, HEX);
+        Serial.print("xResolution: ");   Serial.println(cfg->xResolution);
+        Serial.print("yResolution: ");   Serial.println(cfg->yResolution);
+        Serial.print("touchNumber: ");   Serial.println(cfg->touchNumber);
+        Serial.print("moduleSwitch1: 0b"); Serial.println(cfg->moduleSwitch1, BIN);
+        Serial.print("moduleSwitch2: 0b"); Serial.println(cfg->moduleSwitch2, BIN);
+        Serial.print("shakeCount: ");    Serial.println(cfg->shakeCount);
+        Serial.print("filter: 0b");        Serial.println(cfg->filter, BIN);
+        Serial.print("largeTouch: 0x");    Serial.println(cfg->largeTouch, HEX);
+        Serial.print("noiseReduction: 0x"); Serial.println(cfg->noiseReduction, HEX);
+        Serial.print("screenLevel touch: 0x"); Serial.println(cfg->screenLevel.touch, HEX);
+        Serial.print("screenLevel leave: 0x"); Serial.println(cfg->screenLevel.leave, HEX);
+        Serial.print("lowPowerControl: "); Serial.println(cfg->lowPowerControl);
+        Serial.print("refreshRate: "); Serial.println(cfg->refreshRate);
+        Serial.print("xThreshold: "); Serial.println(cfg->xThreshold);
+        Serial.print("yThreshold: "); Serial.println(cfg->yThreshold);
+        Serial.print("xSpeedLimit: "); Serial.println(cfg->xSpeedLimit);
+        Serial.print("ySpeedLimit: "); Serial.println(cfg->ySpeedLimit);
+        Serial.print("vSpace: "); Serial.println(cfg->vSpace);
+        Serial.print("hSpace: "); Serial.println(cfg->hSpace);
+        cfg->lowPowerControl = 4;
+        //cfg->moduleSwitch1 = 0x0D;
+        //touch.writeConfig(cfg);
+        */
+    }
+}
+
+void my_touchpad_read(lv_indev_drv_t* drv, lv_indev_data_t* data) {
+    uint8_t contacts = touch.touched();
+    data->state = contacts ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
+    if (contacts >= 1) {
+        if (data->state == LV_INDEV_STATE_PR) {
+            // FOR 270 degrees screen rotation
+            data->point.y = SCREENHEIGHT - touch.getPoint(0).y;
+            data->point.x = SCREENWIDTH - touch.getPoint(0).x;
+            Serial.printf("touch at %u, %u\n", data->point.x, data->point.y);
+        }
+    } else {
+        data->state = LV_INDEV_STATE_REL;
+    }
 }
 
 void setup() {
+    TFT.onCompleteCB(DMAfinished);
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
 
-  TFT.onCompleteCB(DMAfinished);
-  //delay(500);
+    delay(1000);
 
-  pinMode(13, OUTPUT);
-  digitalWrite(13,!digitalRead(13));
+    // while (!Serial && millis() < 5000) {}  //wait up to 2 seconds for Serial Monitor to connect
+    Serial.println("RA8876_mm 8080");
+    Serial.print("Compiled ");
+    Serial.print(__DATE__);
+    Serial.print(" at ");
+    Serial.println(__TIME__);
+    Serial.println("Graphics setup");
 
-  digitalWrite(myTRIG, HIGH);
-  pinMode(myTRIG, OUTPUT);
- 
-  
+    bool success = TFT.begin(20);  // MHz  => select one of 1,2,4,8,12,20,24,30,40,60,120 MHz  (20 MHz is working well on the MM ATP board with dupont cables)
+    if (success) {
+        Serial.println("TFT.begin() success");
+    } else {
+        Serial.println("TFT.begin() failed");
+    }
+    setupTouch();
 
-  delay(1000);
- 
-  //while (!Serial && millis() < 5000) {}  //wait up to 2 seconds for Serial Monitor to connect
-  Serial.println("r7studio GPCF-LCD 8080");
-  Serial.print("Compiled ");
-  Serial.print(__DATE__);
-  Serial.print(" at ");
-  Serial.println(__TIME__);
+    TFT.backlight(true);  // uses internal PWM to control backlight brightness
+    TFT.setBrightness(30);
 
-  Serial.println("Graphics setup");
+    // TFT.Color_Bar_ON(); while (true); // this is a test pattern to check if the display is working. It should show a color bar. If not, check your wiring.
 
+    TFT.setRotation(3); // 270 degrees rotation for coordinates and scanning and memory write direction on the RA8876. Note that we will must rotate the lvgl buffer.
 
-  //TFT Lowlevel
-  //delay(1000);
-  //pinMode(BACKLIGHT, OUTPUT);
-  //analogWriteFrequency(BACKLIGHT, 50000); //50kHz - make sure the add a series resistor to the PWM output pin to limit slew rate
-  //analogWrite(BACKLIGHT, toBeBrightness);  //256 = 818mA@5V
-  //analogWrite(BACKLIGHT, 32);  //256 = 818mA@5V
-  //delay(500);
-  /*
-  switch (baud_div) {
-	case 1:  _baud_div = 240;
-			  break;
-    case 2:  _baud_div = 120;
-              break;
-    case 4:  _baud_div = 60;
-              break;
-    case 8:  _baud_div = 30;
-              break;
-    case 12: _baud_div = 20;
-              break;
-    case 20: _baud_div = 12;
-              break;
-    case 24: _baud_div = 10;
-              break;
-    case 30: _baud_div = 8;
-              break;
-    case 40: _baud_div = 6;
-              break;
-    case 60: _baud_div = 4;
-              break;
-    case 120: _baud_div = 2;
-              break;
-   default: _baud_div = 20; // 12Mhz
-              break;           
-              */
-  bool success = TFT.begin(20); //MHz  => 4 Mhz on Breadboard
-  if (success) {
-    Serial.println("TFT.begin() success");
-  } else {
-    Serial.println("TFT.begin() failed");
-  }
-  TFT.setRotation(0);
+    for (uint8_t i = 1; i < 10; i++) {
+        TFT.useCanvas(i);
+        TFT.fillScreen(COLOR65K_BLACK);
+    }
 
-  TFT.backlight(true);
-  TFT.setBrightness(50);
+    // screen is set up. Now proceeding with lvgl setup.
+    lv_init();
+    lv_disp_draw_buf_init(&disp_buf, buf_1, buf_2, BUFFER_SIZE); 
 
-  //TFT.lcdHorizontalWidthVerticalHeight(400,1280);
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.hor_res = SCREENWIDTH;
+    disp_drv.ver_res = SCREENHEIGHT;
+    disp_drv.flush_cb = my_disp_flush;
+    disp_drv.draw_buf = &disp_buf;
+    disp_drv.antialiasing = 1;
+    disp_drv.direct_mode = 0;
+    disp_drv.full_refresh = 0;
+    disp_drv.sw_rotate = 0;
+    disp_drv.rotated = LV_DISP_ROT_NONE;
+    disp = lv_disp_drv_register(&disp_drv);
 
-  //TFT.Color_Bar_ON();
-  /*
-  TFT.useCanvas(0);
-  TFT.fillScreen(COLOR65K_BLACK);
-  TFT.useCanvas(1);
-  TFT.fillScreen(COLOR65K_BLACK);
-  TFT.useCanvas(2);
-  TFT.fillScreen(COLOR65K_BLACK);
-  TFT.useCanvas(3);
-  TFT.fillScreen(COLOR65K_BLACK);
-  TFT.useCanvas(4);
-  TFT.fillScreen(COLOR65K_WHITE);
-  TFT.useCanvas(5);
-  TFT.fillScreen(COLOR65K_BLACK);
-  TFT.useCanvas(6);
-  TFT.fillScreen(COLOR65K_BLACK);
-  TFT.useCanvas(7);
-  TFT.fillScreen(COLOR65K_BLACK);
-  TFT.useCanvas(8);
-  TFT.fillScreen(COLOR65K_BLACK);
-  TFT.useCanvas(9);
-  TFT.fillScreen(COLOR65K_BLACK);
-  */
-  TFT.useCanvas(0);
+    // initialize the input device driver
+    lv_indev_drv_init(&indev_drv);         
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = my_touchpad_read;   
+    lv_indev_drv_register(&indev_drv);     
 
-   
-  
-  //TFT.drawLine(0, 0, 150, 150, COLOR65K_GREEN);
-
-
-  lv_init();
-
-  
-
-  lv_disp_draw_buf_init(&disp_buf, buf_1, NULL, BUFFER_SIZE); //or with buf_2
- 
-  //Initialize the display driver - basically just the buffers
-  lv_disp_drv_init(&disp_drv);
-  disp_drv.hor_res = SCREENWIDTH;
-  disp_drv.ver_res = SCREENHEIGHT;
-  disp_drv.flush_cb = my_disp_flush;
-  disp_drv.draw_buf = &disp_buf;
-  disp_drv.antialiasing = 1;
-  disp_drv.direct_mode = 0;
-  disp_drv.full_refresh = 0; //new
-  disp_drv.sw_rotate = 0;
-  disp_drv.rotated = LV_DISP_ROT_NONE;      //LV_DISP_ROT_270;
-  disp = lv_disp_drv_register(&disp_drv);
-
-//  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x000000), LV_PART_MAIN);
-  //set foreground color to white
-//  lv_obj_set_style_text_color(lv_scr_act(), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  
-  
-  //do the same for lines
-  lv_obj_set_style_line_color(lv_scr_act(), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  
-  /*
-  static lv_point_t line_points[] = { {2, 2}, {395, 1270}}; //max coordinates 0,0 to 399,1279
-
-  static lv_style_t style_line;
-    lv_style_init(&style_line);
-    lv_style_set_line_width(&style_line, 8);
-    lv_style_set_line_color(&style_line, lv_palette_main(LV_PALETTE_BLUE));
-
-    lv_obj_t * obj;
-    obj = lv_line_create(lv_scr_act());
-    lv_line_set_points(obj, line_points, 2);     
-
-    
-    lv_obj_add_style(obj, &style_line, 0);
-    */
-
-    
-
-   
-    lv_obj_t * obj = lv_obj_create(lv_scr_act());
+    // a little demo using animations
+    lv_obj_t* obj = lv_obj_create(lv_scr_act());
     lv_obj_set_style_bg_color(obj, lv_palette_main(LV_PALETTE_RED), 0);
     lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, 0);
 
-    //lv_obj_align(obj, LV_ALIGN_, 000, -600);
     lv_obj_set_pos(obj, 10, 10);
 
     lv_anim_t a;
@@ -429,53 +276,25 @@ void setup() {
     lv_anim_set_var(&a, obj);
     lv_anim_set_values(&a, 100, 200);
     lv_anim_set_time(&a, 4000);
-    //lv_anim_set_duration(&a, 1000);
     lv_anim_set_playback_delay(&a, 100);
-    lv_anim_set_playback_time(&a, 4000);
-    //lv_anim_set_playback_duration(&a, 300);
-    lv_anim_set_repeat_delay(&a, 4100);
+    lv_anim_set_playback_time(&a, 500);
+    lv_anim_set_repeat_delay(&a, 500);
     lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
 
-    lv_anim_set_exec_cb(&a, anim_size_cb);
+    lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)anim_size_cb);
     lv_anim_start(&a);
-    lv_anim_set_exec_cb(&a, anim_x_cb);
-    lv_anim_set_values(&a, 10, 1000);
+    lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)anim_x_cb);
+    lv_anim_set_values(&a, 100, 1000);
     lv_anim_start(&a);
-    
 
-    for (int i = 0; i < 10; i++) {
-    delayMicroseconds(1);
-    digitalToggleFast(myTRIG);
-  }
-
+    Serial.println("Run Mode.");
 
 }
 
 void loop() {
-  
-  //Graphics::loopGraphics();
-  /*
-  if (blinkTimer.check()) {
-      digitalToggle(LED_BUILTIN);
-      if (digitalRead(LED_BUILTIN)) {
-        //TFT.fillScreen(COLOR65K_GREEN);
-          //TFT.backlight(true);
-          //TFT.setBrightness(64);
-      } else {
-        //TFT.fillScreen(COLOR65K_BLACK);
-        //TFT.drawSquareFill(1, 1, 10, 10, COLOR65K_RED);
-          //TFT.drawLine(0x80, 0x80, 0x88, 0x88, 0xEEEE);
-          //TFT.backlight(false);
-          //TFT.setBrightness(0);
-      }
+    if (lvglTaskTimer.check()) {
+        lv_task_handler(); /* let the GUI do its work */
+        touch.loop();      // call often. LVGL has its own timer for touch handling that checks the driver if a touch has happend which is interrupt driven.
     }
-    */
-
-   //  TFT.updateScreenWithROP(9, 2, 0, 14); //MERGE (Logical OR) Canvas 9 (UI) and 2 (Meters) to Canvas 0 (visible)
-  if (lvglTaskTimer.check()) {
-    lv_task_handler(); /* let the GUI do its work */
-    //touch.loop();
-  }
 }
-

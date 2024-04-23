@@ -29,8 +29,8 @@
 
 class SSD2828 {
 public:
-	SSD2828(const uint8_t CSp = 24, const uint8_t RSTp = 25, const uint8_t SDIp = 26, const uint8_t SCKp = 27);
-
+	SSD2828(uint8_t CSp, uint8_t RSTp, uint8_t SDIp, uint8_t SCKp);
+  
   void reset();
   void initialize();
   void release();
@@ -43,7 +43,7 @@ private:
 
   void SPI_3W_SET_Cmd(uint16_t Sdata);
   void SPI_3W_SET_PAs(uint16_t Sdata);
-  uint8_t SPI_ReadData(void);
+  // uint8_t SPI_ReadData(void); not needed.
   void SPI_WriteData(uint8_t value);
   void SPI_WriteCmd(uint8_t value);
   void GP_COMMAD_PA(uint16_t num);
