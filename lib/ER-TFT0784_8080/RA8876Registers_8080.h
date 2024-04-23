@@ -2,7 +2,7 @@
 /*
  * RA8876Registers_8080.h
  *
- * AUTHOR: Lukas Leuthold
+ * AUTHOR: leutholl
  * DATE: FEB 2024
  * VERSION: 1.0
  *
